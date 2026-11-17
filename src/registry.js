@@ -487,7 +487,9 @@ function text(status, body) {
 	return new Response(body, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
 }
 
-const HELP = `A C3 library registry for libraries on GitHub. In project.json:
+const HELP = `C3 package registry. Can auto-package libraries from GitHub and other sources.
+
+ Since c3 v0.8.6, you can add this directly to your project.json:
 
     "dependencies": [
         "https://<host>/github.com:<owner>/<repo>@<tag or branch>",
@@ -497,13 +499,13 @@ const HELP = `A C3 library registry for libraries on GitHub. In project.json:
 
 then: c3c project fetch <owner>/<name>
 
-The first is a repository that is the library <repo> (its manifest.json at the root). The second
-is the library <name> in a repository: at its root, or in its folder <name>.c3l/, e.g.
+For cases where the repository name doesn't match the library name, you can add the full
+repository path to the URL part:
 
     "https://<host>/github.com/floooh/sokol-c3:floooh/sokol@main"
 
-The third names the folder. A library's versions are its repository's tags and branches; the
-latest is its highest tag, else its default branch. A version can be pinned to the sha256 of
-its .c3l (the x-checksum header of its url in /info): "...@<version>:<sha256>". Files marked
-export-ignore in the repository's .gitattributes are left out.
+Invalid packages are cached as rejected. If you made a mistake, wait and try again later.
+
+Versions can be pinned to branches and tags with "...@<tag>"" and pinned to the hash of its .c3l with "...@<version>:<sha256>".
+
 `;
