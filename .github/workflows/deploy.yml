@@ -1,0 +1,34 @@
+# Tests every push; on main, bundles the script and publishes it to the Edge Script whose id is the
+# SCRIPT_ID secret (bunny's deploy action signs in with GitHub's OIDC token: id-token: write).
+name: Deploy
+
+on:
+  push:
+    branches: ["*"]
+  pull_request:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
+      - name: Publish to bunny.net
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: BunnyWay/actions/deploy-script@main
+        with:
+          script_id: ${{ secrets.SCRIPT_ID }}
+          file: dist/index.js
