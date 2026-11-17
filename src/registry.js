@@ -22,21 +22,38 @@
 //                                   every time, so its sha256 can be pinned; it never changes
 //   GET .../download/<owner>/<name>@<version>   redirects to the .c3l of that version (c3c's
 //                                   default when a version has no url)
-//   GET /index.json                 c3c fetch-list: nothing to list, any repository works
+//   GET /github.com/index.json      the libraries fetched so far that c3c can fetch by name from
+//                                   https://<this host>/github.com (the github.com:<owner>/<repo>
+//                                   form), for c3c fetch-list and c3c fetch <name>
+//   GET /index.json                 every library fetched so far (c3c fetch-list --fetch-url
+//                                   https://<this host>), with the source as its name
 
 import { unzipSync, zipSync } from "fflate";
+import * as store from "./store.js";
 
 const NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/; // a GitHub owner or repository
 const VERSION = /^[A-Za-z0-9][A-Za-z0-9_.+-]*$/; // what c3c accepts as a version
 const SHA = /^[0-9a-f]{40}$/;
-const ZIP_TIME = new Date("1980-01-01T00:00:00Z");
+// Every file's time in the zip: 1980-01-01 00:00, the earliest a zip can hold. fflate writes it in
+// the machine's time zone, so it is made from local fields: the same bytes (and sha256) anywhere.
+const ZIP_TIME = new Date(1980, 0, 1, 0, 0, 0);
 
-// /info is what c3c asks for once per fetch, so it is counted, and the CDN must not answer it
-// (GitHub's answers are kept in memory for a while instead). A .c3l never changes.
+// /info is what c3c asks for once per fetch, so it is counted, and the CDN must not answer it: the
+// script answers from its store instead (store.js). A .c3l never changes.
 const INFO_CACHE = "no-store";
 const PAGE_CACHE = "public, max-age=60";
 const C3L_CACHE = "public, max-age=31536000, immutable";
-const GITHUB_TTL = 5 * 60 * 1000;
+
+const INFO_TTL = 5 * 60; // seconds an /info answer is reused without asking GitHub
+const DENY_TTL = 30 * 60; // seconds a repository that isn't a C3 library is refused without asking
+const MAX_REPO_KB = 200 * 1024; // GitHub's size of the repository (its git data)
+const MAX_ARCHIVE_BYTES = 40 * 1024 * 1024; // the archive of one commit, as downloaded
+
+// Counting: one fetch per visitor (IP), library and hour. Counts gather in memory and go to the
+// database together, at most every COUNT_FLUSH_MS from each running copy of the script, so the
+// writes don't grow with the requests or the number of IPs they come from.
+const SEEN_TTL = 60 * 60;
+const COUNT_FLUSH_MS = 30 * 1000;
 
 // `env.db`, a @bunny.net/database-client connection, keeps the packages seen and their fetches;
 // without one (running locally) nothing is counted.
@@ -46,7 +63,8 @@ export async function handle(request, env = {}) {
 	let path = url.pathname;
 	try {
 		if (path === "/" || path === "") return html(await home(url.host, env.db), PAGE_CACHE);
-		if (path === "/index.json") return json({ libraries: [] }, PAGE_CACHE);
+		if (path === "/index.json") return json(await index(env.db, false), PAGE_CACHE);
+		if (path === "/github.com/index.json") return json(await index(env.db, true), PAGE_CACHE);
 		let m, source, rest;
 		if ((m = path.match(/^\/github\.com(\/(?:info|download)\/([^/]+)\/([^/@]+).*)$/))) {
 			// /github.com:<owner>/<repo>: the repository is the library's owner and name
@@ -61,7 +79,7 @@ export async function handle(request, env = {}) {
 		}
 		if ((m = rest.match(/^\/info\/([^/]+)\/([^/]+)$/))) {
 			const lib = await info(source, m[2], env);
-			await count(env.db, lib);
+			store.in_background(count(env, lib, client_ip(request), url.origin));
 			return json(lib, INFO_CACHE);
 		}
 		if ((m = rest.match(/^\/c3l\/([0-9a-f]{40})\.c3l$/))) {
@@ -88,36 +106,49 @@ class HttpError extends Error {
 	}
 }
 
-// The registry record of the library `name` in a source ({owner, repo, dir, origin}; dir is null
-// when the URL names no folder): the repository's tags, then its branches, as versions.
-const info_cache = new Map();
+// A repository (or folder) that isn't a C3 library this registry serves: missing, without a
+// manifest, providing another name, or too big. Remembered for DENY_TTL.
+class NotLibrary extends HttpError {
+	constructor(message, status = 404) {
+		super(status, message);
+	}
+}
 
+// The registry record of the library `name` in a source ({owner, repo, dir, origin}; dir is null
+// when the URL names no folder): the repository's tags, then its branches, as versions. It is a
+// library only if its manifest.json provides `name`.
 async function info(source, name, env) {
 	check_source(source);
 	if (!NAME.test(name)) throw new HttpError(400, `invalid library name ${name}`);
-	const key = `${source.origin} ${source.owner}/${source.repo}/${source.dir ?? ""}:${name}`.toLowerCase();
-	const hit = info_cache.get(key);
-	if (hit && Date.now() - hit.at < GITHUB_TTL) return hit.value;
-	const value = await info_uncached(source, name, env);
-	info_cache.set(key, { at: Date.now(), value });
+	const key = `${source.owner}/${source.repo}/${source.dir ?? "?"}:${name}`.toLowerCase();
+	const denied = await store.get(source.origin, `deny:${key}`);
+	if (denied) throw new HttpError(denied.status, `${denied.message} (checked in the last 30 minutes)`);
+	const hit = await store.get(source.origin, `info:${key}`);
+	if (hit) return hit;
+	let value;
+	try {
+		value = await info_uncached(source, name, env);
+	} catch (e) {
+		if (e instanceof NotLibrary) {
+			await store.set(source.origin, `deny:${key}`, { status: e.status, message: e.message }, DENY_TTL);
+		}
+		throw e;
+	}
+	await store.set(source.origin, `info:${key}`, value, INFO_TTL);
 	return value;
 }
 
 async function info_uncached({ owner, repo, dir, origin }, name, env) {
-	const [meta, tags, branches] = await Promise.all([
-		github(`/repos/${owner}/${repo}`, env),
+	const meta = await github(`/repos/${owner}/${repo}`, env);
+	if (meta.size > MAX_REPO_KB) {
+		throw new NotLibrary(`${owner}/${repo} is too big (${Math.round(meta.size / 1024)} MB; the limit is ${MAX_REPO_KB / 1024} MB)`, 413);
+	}
+	const [manifest, tags, branches] = await Promise.all([
+		find_manifest(owner, repo, dir, name, env),
 		github(`/repos/${owner}/${repo}/tags?per_page=100`, env),
 		github(`/repos/${owner}/${repo}/branches?per_page=100`, env),
 	]);
-	// No folder named: the root, if the library is there, else <name>.c3l/ (looked up on the
-	// default branch)
-	if (dir === null) {
-		dir = "";
-		if (!(await github_exists(`/repos/${owner}/${repo}/contents/manifest.json`, env))
-			&& (await github_exists(`/repos/${owner}/${repo}/contents/${name}.c3l/manifest.json`, env))) {
-			dir = `${name}.c3l`;
-		}
-	}
+	dir = manifest.dir;
 	const base = `${origin}/github.com/${owner}/${repo}${dir ? "/" + dir : ""}`;
 	const updated = meta.pushed_at || meta.updated_at || new Date().toISOString();
 	const versions = {};
@@ -140,18 +171,63 @@ async function info_uncached({ owner, repo, dir, origin }, name, env) {
 	};
 }
 
+// The library's manifest.json on the repository's default branch, where `dir` says (null: the
+// root, else <name>.c3l/), which must provide `name`: { dir, provides }.
+async function find_manifest(owner, repo, dir, name, env) {
+	const dirs = dir === null ? ["", `${name}.c3l`] : [dir];
+	for (const d of dirs) {
+		const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${d ? d + "/" : ""}manifest.json`, {
+			headers: github_headers(env),
+		});
+		if (res.status === 404) continue;
+		if (res.status === 403 || res.status === 429) throw new HttpError(503, "GitHub's API rate limit; try again later");
+		if (!res.ok) throw new HttpError(502, `GitHub API: ${res.status}`);
+		const file = await res.json();
+		const bytes = Uint8Array.from(atob(String(file.content ?? "").replace(/\s/g, "")), (c) => c.charCodeAt(0));
+		const provides = manifest_provides(new TextDecoder().decode(bytes));
+		const where = `${owner}/${repo}/${d ? d + "/" : ""}manifest.json`;
+		if (!provides) throw new NotLibrary(`${where} has no "provides"`);
+		if (provides !== name) throw new NotLibrary(`${where} provides "${provides}", not "${name}"`);
+		return { dir: d, provides };
+	}
+	const where = dir === null ? `at the root or in ${name}.c3l/` : `in ${dir}/`;
+	throw new NotLibrary(`${owner}/${repo} has no manifest.json ${where}: it is not a C3 library`);
+}
+
+// The "provides" of a manifest.json: JSON, or near enough (comments, trailing commas) for a regex.
+export function manifest_provides(text) {
+	try {
+		const p = JSON.parse(text).provides;
+		if (typeof p === "string") return p;
+	} catch {
+		// not strict JSON
+	}
+	return text.match(/"provides"\s*:\s*"([^"]+)"/)?.[1] ?? null;
+}
+
 // The source's folder of the repository at commit `sha` as a .c3l.
-async function c3l({ owner, repo, dir }, sha, env) {
+async function c3l({ owner, repo, dir, origin }, sha, env) {
 	check_source({ owner, repo, dir });
-	const res = await fetch(`https://codeload.github.com/${owner}/${repo}/zip/${sha}`, {
-		headers: github_headers(env),
-	});
-	if (res.status === 404) throw new HttpError(404, `no commit ${sha} in ${owner}/${repo}`);
-	if (!res.ok) throw new HttpError(502, `GitHub archive: ${res.status}`);
-	const files = repack(new Uint8Array(await res.arrayBuffer()), dir);
-	if (!files["manifest.json"]) {
-		const where = dir ? `in ${dir}/` : "at its root";
-		throw new HttpError(422, `${owner}/${repo} has no manifest.json ${where} at ${sha}: it is not a C3 library`);
+	const key = `c3l:${owner}/${repo}/${dir}`.toLowerCase();
+	const denied = await store.get(origin, `deny:${key}`);
+	if (denied) throw new HttpError(denied.status, `${denied.message} (checked in the last 30 minutes)`);
+	let files;
+	try {
+		const res = await fetch(`https://codeload.github.com/${owner}/${repo}/zip/${sha}`, {
+			headers: github_headers(env),
+		});
+		if (res.status === 404) throw new HttpError(404, `no commit ${sha} in ${owner}/${repo}`);
+		if (!res.ok) throw new HttpError(502, `GitHub archive: ${res.status}`);
+		files = repack(await read_capped(res, MAX_ARCHIVE_BYTES, `${owner}/${repo}`), dir);
+		if (!files["manifest.json"]) {
+			const where = dir ? `in ${dir}/` : "at its root";
+			throw new NotLibrary(`${owner}/${repo} has no manifest.json ${where} at ${sha}: it is not a C3 library`, 422);
+		}
+	} catch (e) {
+		if (e instanceof NotLibrary) {
+			await store.set(origin, `deny:${key}`, { status: e.status, message: e.message }, DENY_TTL);
+		}
+		throw e;
 	}
 	const body = zipSync(files, { level: 6, mtime: ZIP_TIME });
 	const sha256 = await sha256_hex(body);
@@ -163,6 +239,29 @@ async function c3l({ owner, repo, dir }, sha, env) {
 			"x-checksum": `sha256:${sha256}`,
 		},
 	});
+}
+
+// The body of `res`, refusing (NotLibrary, 413) one over `limit` bytes without reading the rest.
+async function read_capped(res, limit, what) {
+	const too_big = () => new NotLibrary(`${what}'s archive is too big (the limit is ${limit / 1024 / 1024} MB)`, 413);
+	if (Number(res.headers.get("content-length")) > limit) throw too_big();
+	const reader = res.body.getReader();
+	const chunks = [];
+	let total = 0;
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		total += value.length;
+		if (total > limit) {
+			await reader.cancel().catch(() => {});
+			throw too_big();
+		}
+		chunks.push(value);
+	}
+	const out = new Uint8Array(total);
+	let at = 0;
+	for (const c of chunks) out.set(c, at), at += c.length;
+	return out;
 }
 
 // GitHub's archive without its top folder (<repo>-<sha>/), dotfiles and symlinks (which it stores
@@ -221,16 +320,15 @@ function github_headers(env) {
 
 async function github(path, env) {
 	const res = await fetch(`https://api.github.com${path}`, { headers: github_headers(env) });
-	if (res.status === 404) throw new HttpError(404, `no GitHub repository ${path.split("/").slice(2, 4).join("/")}`);
+	if (res.status === 404) throw new NotLibrary(`no GitHub repository ${path.split("/").slice(2, 4).join("/")}`);
 	if (res.status === 403 || res.status === 429) throw new HttpError(503, "GitHub's API rate limit; try again later");
 	if (!res.ok) throw new HttpError(502, `GitHub API: ${res.status}`);
 	return res.json();
 }
 
-async function github_exists(path, env) {
-	const res = await fetch(`https://api.github.com${path}`, { method: "HEAD", headers: github_headers(env) });
-	if (res.status === 403 || res.status === 429) throw new HttpError(503, "GitHub's API rate limit; try again later");
-	return res.ok;
+// The visitor's address: bunny sets X-Real-IP (and a single-address X-Forwarded-For).
+function client_ip(request) {
+	return request.headers.get("x-real-ip") || request.headers.get("x-forwarded-for") || "unknown";
 }
 
 // Orders tags as versions: v1.10.0 after v1.9.0, v2.0.0-rc1 before v2.0.0; anything not
@@ -274,17 +372,66 @@ export const SCHEMA = `CREATE TABLE IF NOT EXISTS packages (
 	last_seen TEXT NOT NULL
 )`;
 
-async function count(db, lib) {
-	if (!db) return;
+// Counts a fetch of `lib` by `ip`, once an hour per visitor: the visitors seen are kept in the
+// store as hashes of (salt, ip, library, hour), never as addresses.
+const pending = new Map(); // library -> { n, description, latest }
+let flushing = null;
+
+export async function count(env, lib, ip, origin) {
+	if (!env.db) return;
+	const hour = Math.floor(Date.now() / 3600000);
+	const seen = await sha256_hex(new TextEncoder().encode(`${env.IP_SALT ?? ""}|${ip}|${lib.library}|${hour}`));
+	if (await store.get(origin, `seen:${seen}`)) return;
+	await store.set(origin, `seen:${seen}`, 1, SEEN_TTL);
+	const p = pending.get(lib.library);
+	pending.set(lib.library, { n: (p?.n ?? 0) + 1, description: lib.description, latest: lib.latest });
+	if (!flushing) {
+		flushing = new Promise((resolve) => setTimeout(resolve, COUNT_FLUSH_MS)).then(() => flush(env.db));
+		store.in_background(flushing);
+	}
+}
+
+// Writes the counts gathered so far, in one transaction.
+export async function flush(db) {
+	flushing = null;
+	const items = [...pending];
+	pending.clear();
+	if (!items.length || !db) return;
 	const now = new Date().toISOString();
+	const upsert = db.prepare(`INSERT INTO packages (library, description, latest, fetches, first_seen, last_seen)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT (library) DO UPDATE SET fetches = fetches + excluded.fetches,
+			description = excluded.description, latest = excluded.latest, last_seen = excluded.last_seen`);
 	try {
-		await db.sql`INSERT INTO packages (library, description, latest, fetches, first_seen, last_seen)
-			VALUES (${lib.library}, ${lib.description}, ${lib.latest}, 1, ${now}, ${now})
-			ON CONFLICT (library) DO UPDATE SET fetches = fetches + 1, description = excluded.description,
-				latest = excluded.latest, last_seen = excluded.last_seen`.run();
+		await db.batch(items.map(([library, p]) => upsert.bind(library, p.description, p.latest, p.n, now, now)), { mode: "immediate" });
 	} catch (e) {
 		console.error("count:", e.message);
 	}
+}
+
+// The registry index (c3c's format) of the packages seen. `fetchable`: only those whose name c3c can
+// ask /github.com/info for (a repository that is the library: <owner>/<repo>, no folder).
+async function index(db, fetchable) {
+	let rows = [];
+	if (db) {
+		try {
+			rows = await db.sql`SELECT library, description, latest, last_seen FROM packages
+				ORDER BY library LIMIT 5000`.all();
+		} catch (e) {
+			console.error("index:", e.message);
+		}
+	}
+	if (fetchable) rows = rows.filter((r) => String(r.library).split("/").length === 2);
+	return {
+		libraries: rows.map((r) => ({
+			library: r.library,
+			description: r.description,
+			latest: r.latest,
+			updated: r.last_seen,
+			tags: [],
+			versions: [r.latest],
+		})),
+	};
 }
 
 async function home(host, db) {
