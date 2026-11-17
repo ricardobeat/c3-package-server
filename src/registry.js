@@ -459,7 +459,8 @@ async function home(host, db) {
 <title>${esc(host)}: C3 libraries from GitHub</title>
 <style>
 body { font: 13px/1.5 ui-monospace, Menlo, Consolas, monospace; margin: 2em; max-width: 60em; }
-table { border-collapse: collapse; } th, td { text-align: left; padding: 0 1.5em 0 0; vertical-align: top; }
+table { border-collapse: collapse; } th, td { text-align: left; padding: 0 1.5em 0 0; vertical-align: top; white-space: nowrap; }
+td:last-child { white-space: normal; padding-right: 0; }
 th { font-weight: normal; color: #888; } .n { text-align: right; } pre { font: inherit; }
 a { color: inherit; }
 </style></head><body>
